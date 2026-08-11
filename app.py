@@ -1,6 +1,8 @@
 import io
 import json
+import re
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -45,6 +47,18 @@ LABELS = {
 
 QWEN_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
+SUPPORTED_AUDIO_TYPES = ["wav", "mp3", "m4a", "flac", "ogg", "aac", "webm"]
+
+AUDIO_MIME_TYPES = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".aac": "audio/aac",
+    ".webm": "audio/webm",
+}
+
 
 # ============================================================
 # LOAD MODEL / DATA
@@ -63,6 +77,50 @@ def load_cnn_model():
 @st.cache_data
 def load_metadata():
     return pd.read_csv(METADATA_PATH)
+
+
+# ============================================================
+# KONVERSI AUDIO
+# ============================================================
+def convert_to_standard_wav(input_path):
+    """
+    Konversi format audio umum ke WAV mono 16 kHz menggunakan ffmpeg.
+    Ini membuat MP3/M4A/FLAC/OGG/AAC/WEBM diproses dengan jalur
+    preprocessing yang sama seperti WAV.
+    """
+    input_path = str(input_path)
+    output_path = f"{input_path}.converted.wav"
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-loglevel", "error",
+        "-i", input_path,
+        "-vn",
+        "-ac", "1",
+        "-ar", str(SAMPLE_RATE),
+        "-c:a", "pcm_s16le",
+        output_path,
+    ]
+
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "ffmpeg belum tersedia. Pastikan file packages.txt berisi `ffmpeg`."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip()
+        raise RuntimeError(
+            f"Format audio gagal dikonversi oleh ffmpeg. {detail}"
+        ) from exc
+
+    return output_path
 
 
 # ============================================================
@@ -174,18 +232,9 @@ def predict_audio(model, audio_path):
 # ============================================================
 def fallback_feedback(result):
     if result["label"] == 0:
-        return (
-            "Bacaan terdeteksi **BENAR** oleh model CNN. "
-            "Pertahankan dengungan ghunnah agar tetap jelas dan konsisten. "
-            "Hasil ini adalah prediksi model dan bukan penilaian tajwid dari guru secara langsung."
-        )
+        return "Pertahankan dengungan ghunnah agar tetap jelas dan konsisten."
 
-    return (
-        "Bacaan terdeteksi **SALAH** oleh model CNN. "
-        "Fokuskan latihan pada kejelasan dan kestabilan dengungan ghunnah, "
-        "lalu rekam ulang dengan suara yang jelas. "
-        "Model CNN ini hanya menentukan BENAR/SALAH dan tidak menentukan jenis kesalahan yang lebih spesifik."
-    )
+    return "Latih kembali kejelasan dan kestabilan dengungan ghunnah, lalu rekam ulang dengan suara yang jelas."
 
 
 def get_hf_token():
@@ -193,6 +242,28 @@ def get_hf_token():
         return st.secrets["HF_TOKEN"]
     except Exception:
         return os.getenv("HF_TOKEN")
+
+
+def keep_one_feedback(text):
+    """Pastikan output akhir hanya satu feedback."""
+    if not text:
+        return text
+
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    if not lines:
+        return str(text).strip()
+
+    first = lines[0]
+
+    # Hapus awalan bullet / nomor jika model masih mengeluarkannya.
+    first = re.sub(r"^\s*(?:[-*•]+|\d+[\.\)])\s*", "", first).strip()
+
+    # Jika masih berupa beberapa kalimat, tampilkan kalimat pertama saja.
+    match = re.match(r"(.+?[.!?])(?:\s|$)", first)
+    if match:
+        first = match.group(1).strip()
+
+    return first
 
 
 def qwen_feedback(result, metadata):
@@ -222,11 +293,11 @@ def qwen_feedback(result, metadata):
 
     system_prompt = (
         "Kamu adalah asisten latihan bacaan ghunnah. "
-        "Berikan feedback singkat dalam Bahasa Indonesia. "
+        "Berikan tepat SATU feedback singkat dalam Bahasa Indonesia. "
         "Jangan mengarang jenis kesalahan yang tidak diberikan oleh model. "
         "CNN hanya menghasilkan label BENAR atau SALAH. "
         "Jangan menyatakan hasil sebagai diagnosis atau keputusan guru. "
-        "Gunakan bahasa yang jelas, sopan, dan praktis."
+        "Gunakan bahasa yang jelas, sopan, dan praktis. Jangan gunakan bullet, daftar, atau penomoran."
     )
 
     user_prompt = f"""
@@ -238,9 +309,10 @@ Hasil CNN:
 Contoh gaya feedback dari metadata dataset:
 {references}
 
-Buat feedback 2–3 kalimat untuk pengguna.
-Jika label SALAH, sarankan latihan ghunnah secara umum tanpa menebak detail kesalahan lain.
-Jika label BENAR, beri penguatan singkat tanpa menyatakan bacaan pasti sempurna.
+Buat tepat SATU feedback saja dalam SATU kalimat.
+Jangan gunakan bullet, daftar, atau penomoran.
+Jika label SALAH, berikan satu saran latihan ghunnah secara umum tanpa menebak detail kesalahan lain.
+Jika label BENAR, berikan satu penguatan singkat tanpa menyatakan bacaan pasti sempurna.
 """.strip()
 
     client = InferenceClient(
@@ -260,7 +332,7 @@ Jika label BENAR, beri penguatan singkat tanpa menyatakan bacaan pasti sempurna.
         top_p=0.9,
     )
 
-    return output.choices[0].message.content.strip()
+    return keep_one_feedback(output.choices[0].message.content.strip())
 
 
 # ============================================================
@@ -281,7 +353,7 @@ st.caption(
 with st.expander("Tentang model"):
     st.markdown(
         """
-- **Input:** audio WAV
+- **Input:** WAV, MP3, M4A, FLAC, OGG, AAC, atau WEBM
 - **Sample rate:** 16 kHz
 - **Silence trimming:** `top_db=30`
 - **Fitur:** Log-Mel Spectrogram, 64 Mel bands
@@ -295,22 +367,26 @@ with st.expander("Tentang model"):
     )
 
 uploaded_file = st.file_uploader(
-    "Upload rekaman bacaan (.wav)",
-    type=["wav"],
-    help="Gunakan rekaman yang cukup jelas dan minim noise.",
+    "Upload rekaman bacaan",
+    type=SUPPORTED_AUDIO_TYPES,
+    help="Format: WAV, MP3, M4A, FLAC, OGG, AAC, atau WEBM. Gunakan rekaman yang cukup jelas dan minim noise.",
 )
 
 if uploaded_file is None:
-    st.info("Upload file WAV untuk mulai melakukan prediksi.")
+    st.info("Upload rekaman audio untuk mulai melakukan prediksi.")
     st.stop()
 
 audio_bytes = uploaded_file.getvalue()
-st.audio(audio_bytes, format="audio/wav")
+uploaded_suffix = Path(uploaded_file.name).suffix.lower()
+audio_mime = AUDIO_MIME_TYPES.get(uploaded_suffix, "audio/wav")
+st.audio(audio_bytes, format=audio_mime)
 
 if st.button("Analisis bacaan", type="primary", use_container_width=True):
     try:
         with st.spinner("Memproses audio dan menjalankan CNN..."):
-            suffix = Path(uploaded_file.name).suffix or ".wav"
+            suffix = Path(uploaded_file.name).suffix.lower() or ".wav"
+            converted_path = None
+
             with tempfile.NamedTemporaryFile(
                 suffix=suffix,
                 delete=False,
@@ -319,14 +395,20 @@ if st.button("Analisis bacaan", type="primary", use_container_width=True):
                 tmp_path = tmp.name
 
             try:
+                # Semua format distandarkan menjadi WAV mono 16 kHz
+                # sebelum masuk ke preprocessing CNN.
+                converted_path = convert_to_standard_wav(tmp_path)
+
                 model = load_cnn_model()
                 metadata = load_metadata()
-                result = predict_audio(model, tmp_path)
+                result = predict_audio(model, converted_path)
             finally:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+                for path_to_remove in [tmp_path, converted_path]:
+                    if path_to_remove:
+                        try:
+                            os.remove(path_to_remove)
+                        except OSError:
+                            pass
 
         if result["label"] == 0:
             st.success("Hasil: BENAR")
