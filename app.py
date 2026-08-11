@@ -346,8 +346,8 @@ st.set_page_config(
 
 st.title("🎙️ Deteksi Ghunnah")
 st.caption(
-    "CNN Improved-v1 8 detik • Log-Mel Spectrogram • "
-    "threshold validation 0.51"
+    "CNN Improved-v1 8 detik • Rekam langsung / upload audio • "
+    "Log-Mel Spectrogram • threshold validation 0.51"
 )
 
 with st.expander("Tentang model"):
@@ -366,25 +366,63 @@ with st.expander("Tentang model"):
         """
     )
 
-uploaded_file = st.file_uploader(
-    "Upload rekaman bacaan",
-    type=SUPPORTED_AUDIO_TYPES,
-    help="Format: WAV, MP3, M4A, FLAC, OGG, AAC, atau WEBM. Gunakan rekaman yang cukup jelas dan minim noise.",
+st.subheader("Masukkan bacaan")
+
+input_mode = st.radio(
+    "Pilih sumber audio",
+    ["🎙️ Rekam suara", "📁 Upload file"],
+    horizontal=True,
+    label_visibility="collapsed",
 )
 
-if uploaded_file is None:
-    st.info("Upload rekaman audio untuk mulai melakukan prediksi.")
+audio_source = None
+audio_bytes = None
+audio_suffix = ".wav"
+audio_mime = "audio/wav"
+
+if input_mode == "🎙️ Rekam suara":
+    st.caption("Tekan ikon mikrofon, baca ghunnah, lalu hentikan rekaman.")
+    recorded_audio = st.audio_input(
+        "Rekam bacaan",
+        sample_rate=SAMPLE_RATE,
+        help="Izinkan akses mikrofon pada browser jika diminta.",
+    )
+
+    if recorded_audio is not None:
+        audio_source = recorded_audio
+        audio_bytes = recorded_audio.getvalue()
+        audio_suffix = ".wav"
+        audio_mime = "audio/wav"
+
+else:
+    uploaded_file = st.file_uploader(
+        "Upload rekaman bacaan",
+        type=SUPPORTED_AUDIO_TYPES,
+        help=(
+            "Format: WAV, MP3, M4A, FLAC, OGG, AAC, atau WEBM. "
+            "Gunakan rekaman yang cukup jelas dan minim noise."
+        ),
+    )
+
+    if uploaded_file is not None:
+        audio_source = uploaded_file
+        audio_bytes = uploaded_file.getvalue()
+        audio_suffix = audio_suffix
+        audio_mime = AUDIO_MIME_TYPES.get(audio_suffix, "audio/wav")
+
+if audio_source is None:
+    if input_mode == "🎙️ Rekam suara":
+        st.info("Rekam suara terlebih dahulu untuk mulai melakukan prediksi.")
+    else:
+        st.info("Upload rekaman audio untuk mulai melakukan prediksi.")
     st.stop()
 
-audio_bytes = uploaded_file.getvalue()
-uploaded_suffix = Path(uploaded_file.name).suffix.lower()
-audio_mime = AUDIO_MIME_TYPES.get(uploaded_suffix, "audio/wav")
 st.audio(audio_bytes, format=audio_mime)
 
 if st.button("Analisis bacaan", type="primary", use_container_width=True):
     try:
         with st.spinner("Memproses audio dan menjalankan CNN..."):
-            suffix = Path(uploaded_file.name).suffix.lower() or ".wav"
+            suffix = audio_suffix
             converted_path = None
 
             with tempfile.NamedTemporaryFile(
