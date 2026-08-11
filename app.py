@@ -245,9 +245,9 @@ Jika label BENAR, beri penguatan singkat tanpa menyatakan bacaan pasti sempurna.
 
     client = InferenceClient(
         model=QWEN_MODEL,
-        provider="auto",
+        provider="featherless-ai",
         token=token,
-        timeout=60,
+        timeout=120,
     )
 
     output = client.chat_completion(
@@ -350,7 +350,8 @@ if st.button("Analisis bacaan", type="primary", use_container_width=True):
 
         st.caption(
             f'Threshold = {CLASSIFICATION_THRESHOLD:.2f} • '
-            f'Durasi setelah trimming = {result["trimmed_duration"]:.2f} detik'
+            f'Durasi setelah trimming = {result["trimmed_duration"]:.2f} detik • '
+            f'CNN menggunakan maksimal 501 frame (~8 detik awal)'
         )
 
         st.subheader("Feedback")
@@ -364,9 +365,10 @@ if st.button("Analisis bacaan", type="primary", use_container_width=True):
                     feedback = qwen_feedback(result, metadata)
             except Exception as exc:
                 st.warning(
-                    "Qwen API tidak dapat digunakan saat ini. "
-                    "Feedback lokal ditampilkan sebagai cadangan."
+                    "Qwen API gagal, sehingga feedback lokal digunakan. "
+                    "Lihat detail error di bawah."
                 )
+                st.code(f"{type(exc).__name__}: {exc}")
 
         if not feedback:
             feedback = fallback_feedback(result)
