@@ -40,6 +40,17 @@ MAX_FRAMES = 501
 # dipilih hanya dari validation set.
 CLASSIFICATION_THRESHOLD = 0.51
 
+# Lapisan validasi aplikasi (bukan perubahan threshold eksperimen CNN).
+# Jika skor tertinggi masih di bawah 60%, aplikasi memilih abstain / tidak yakin.
+MIN_DISPLAY_CONFIDENCE = 0.60
+
+# Gate sederhana agar rekaman kosong/sangat pelan tidak diklasifikasikan CNN.
+MIN_AUDIO_DURATION = 0.40
+MIN_RMS_AMPLITUDE = 0.002
+MIN_PEAK_AMPLITUDE = 0.010
+MIN_ACTIVE_SECONDS = 0.20
+ACTIVE_FRAME_RMS = 0.003
+
 LABELS = {
     0: "BENAR",
     1: "SALAH",
@@ -126,24 +137,84 @@ def convert_to_standard_wav(input_path):
 # ============================================================
 # PREPROCESSING
 # ============================================================
+class AudioQualityError(ValueError):
+    """Audio tidak layak diteruskan ke CNN."""
+
+
+def validate_audio_quality(y):
+    if y is None or len(y) == 0:
+        raise AudioQualityError(
+            "Audio kosong. Rekam atau upload bacaan yang memiliki suara."
+        )
+
+    y = np.asarray(y, dtype=np.float32)
+
+    if not np.all(np.isfinite(y)):
+        raise AudioQualityError(
+            "Audio tidak valid. Silakan rekam atau upload ulang."
+        )
+
+    duration = len(y) / SAMPLE_RATE
+    rms = float(np.sqrt(np.mean(np.square(y), dtype=np.float64) + 1e-12))
+    peak = float(np.max(np.abs(y)))
+
+    frame_rms = librosa.feature.rms(
+        y=y,
+        frame_length=1024,
+        hop_length=HOP_LENGTH,
+        center=True,
+    )[0]
+
+    active_frames = int(np.sum(frame_rms >= ACTIVE_FRAME_RMS))
+    active_seconds = active_frames * HOP_LENGTH / SAMPLE_RATE
+
+    metrics = {
+        "original_duration": duration,
+        "rms": rms,
+        "peak": peak,
+        "active_seconds": active_seconds,
+    }
+
+    if duration < MIN_AUDIO_DURATION:
+        raise AudioQualityError(
+            "Rekaman terlalu pendek. Rekam bacaan sedikit lebih lama lalu coba lagi."
+        )
+
+    # Untuk kasus benar-benar hening / mikrofon tidak menangkap ucapan.
+    if (
+        (rms < MIN_RMS_AMPLITUDE and peak < MIN_PEAK_AMPLITUDE)
+        or active_seconds < MIN_ACTIVE_SECONDS
+    ):
+        raise AudioQualityError(
+            "Suara tidak terdeteksi atau terlalu pelan. "
+            "Dekatkan mikrofon, ucapkan bacaan dengan jelas, lalu rekam ulang."
+        )
+
+    return metrics
+
+
 def load_audio_trimmed(audio_path):
     original_audio, _ = librosa.load(
         audio_path,
         sr=SAMPLE_RATE,
         mono=True,
     )
+    original_audio = original_audio.astype(np.float32)
+
+    quality_metrics = validate_audio_quality(original_audio)
 
     trimmed_audio, _ = librosa.effects.trim(
         original_audio,
         top_db=SILENCE_TOP_DB,
     )
 
-    # Sama dengan notebook: jika hasil trimming kosong,
-    # gunakan audio asli.
+    # Jika trim gagal menghasilkan bagian aktif, jangan menganggapnya bacaan benar.
     if trimmed_audio.size == 0:
-        trimmed_audio = original_audio
+        raise AudioQualityError(
+            "Tidak ditemukan bagian suara yang dapat dianalisis."
+        )
 
-    return trimmed_audio.astype(np.float32)
+    return trimmed_audio.astype(np.float32), quality_metrics
 
 
 def pad_or_crop_spectrogram(logmel, max_frames=MAX_FRAMES):
@@ -195,34 +266,43 @@ def extract_logmel(y):
 
 
 def preprocess_audio(audio_path):
-    y = load_audio_trimmed(audio_path)
+    y, quality_metrics = load_audio_trimmed(audio_path)
     logmel = extract_logmel(y)
 
     # (64, 501) -> (1, 64, 501, 1)
     x = np.expand_dims(logmel, axis=-1)
     x = np.expand_dims(x, axis=0).astype(np.float32)
 
-    return x, y, logmel
+    return x, y, logmel, quality_metrics
 
 
 # ============================================================
 # INFERENCE
 # ============================================================
 def predict_audio(model, audio_path):
-    x, y_trimmed, logmel = preprocess_audio(audio_path)
+    x, y_trimmed, logmel, quality_metrics = preprocess_audio(audio_path)
 
     prob_salah = float(
         np.asarray(model(x, training=False)).reshape(-1)[0]
     )
+    prob_benar = 1.0 - prob_salah
 
+    # Prediksi mentah CNN tetap menggunakan threshold eksperimen 0.51.
     pred_label = int(prob_salah >= CLASSIFICATION_THRESHOLD)
+    confidence = max(prob_benar, prob_salah)
+
+    # Lapisan UX: jangan memaksakan keputusan jika keluaran dekat 50:50.
+    is_uncertain = confidence < MIN_DISPLAY_CONFIDENCE
 
     return {
         "label": pred_label,
         "label_name": LABELS[pred_label],
         "prob_salah": prob_salah,
-        "prob_benar": 1.0 - prob_salah,
+        "prob_benar": prob_benar,
+        "confidence": confidence,
+        "is_uncertain": is_uncertain,
         "trimmed_duration": len(y_trimmed) / SAMPLE_RATE,
+        "quality": quality_metrics,
         "logmel": logmel,
     }
 
@@ -361,7 +441,8 @@ with st.expander("Tentang model"):
 - **Normalisasi:** Z-score per audio
 - **Panjang input CNN:** 501 frame
 - **Kelas:** `0 = BENAR`, `1 = SALAH`
-- **Threshold:** `0.51`
+- **Threshold CNN:** `0.51`
+- **Validasi aplikasi:** skor tertinggi `< 60%` ditampilkan sebagai **TIDAK YAKIN**
 - **Catatan:** SpecAugment hanya digunakan saat training, bukan saat inference.
         """
     )
@@ -407,7 +488,7 @@ else:
     if uploaded_file is not None:
         audio_source = uploaded_file
         audio_bytes = uploaded_file.getvalue()
-        audio_suffix = audio_suffix
+        audio_suffix = Path(uploaded_file.name).suffix.lower() or ".wav"
         audio_mime = AUDIO_MIME_TYPES.get(audio_suffix, "audio/wav")
 
 if audio_source is None:
@@ -448,18 +529,20 @@ if st.button("Analisis bacaan", type="primary", use_container_width=True):
                         except OSError:
                             pass
 
-        if result["label"] == 0:
+        if result["is_uncertain"]:
+            st.warning("Hasil: TIDAK YAKIN — silakan rekam ulang")
+        elif result["label"] == 0:
             st.success("Hasil: BENAR")
         else:
             st.error("Hasil: SALAH")
 
         col1, col2 = st.columns(2)
         col1.metric(
-            "Probabilitas BENAR",
+            "Skor model BENAR",
             f'{result["prob_benar"] * 100:.2f}%',
         )
         col2.metric(
-            "Probabilitas SALAH",
+            "Skor model SALAH",
             f'{result["prob_salah"] * 100:.2f}%',
         )
 
@@ -468,8 +551,18 @@ if st.button("Analisis bacaan", type="primary", use_container_width=True):
             text=f'P(SALAH) = {result["prob_salah"]:.4f}',
         )
 
+        if result["is_uncertain"]:
+            st.caption(
+                "Skor masih dekat 50:50, sehingga aplikasi tidak memaksakan "
+                "prediksi BENAR/SALAH. Rekam ulang dengan bacaan ghunnah yang jelas."
+            )
+        else:
+            st.caption(
+                f'Threshold CNN = {CLASSIFICATION_THRESHOLD:.2f} • '
+                f'Skor tertinggi = {result["confidence"] * 100:.2f}%'
+            )
+
         st.caption(
-            f'Threshold = {CLASSIFICATION_THRESHOLD:.2f} • '
             f'Durasi setelah trimming = {result["trimmed_duration"]:.2f} detik • '
             f'CNN menggunakan maksimal 501 frame (~8 detik awal)'
         )
@@ -479,7 +572,12 @@ if st.button("Analisis bacaan", type="primary", use_container_width=True):
         feedback = None
         hf_token = get_hf_token()
 
-        if hf_token:
+        if result["is_uncertain"]:
+            feedback = (
+                "Rekam ulang bacaan dengan suara lebih jelas dan usahakan bagian "
+                "ghunnah berada di awal rekaman."
+            )
+        elif hf_token:
             try:
                 with st.spinner("Membuat feedback dengan Qwen2.5-1.5B..."):
                     feedback = qwen_feedback(result, metadata)
@@ -508,11 +606,20 @@ if st.button("Analisis bacaan", type="primary", use_container_width=True):
                     "label_numeric": result["label"],
                     "label": result["label_name"],
                     "probability_error": round(result["prob_salah"], 6),
-                    "threshold": CLASSIFICATION_THRESHOLD,
+                    "threshold_cnn": CLASSIFICATION_THRESHOLD,
+                    "display_min_confidence": MIN_DISPLAY_CONFIDENCE,
+                    "is_uncertain": result["is_uncertain"],
+                    "audio_rms": round(result["quality"]["rms"], 6),
+                    "audio_peak": round(result["quality"]["peak"], 6),
+                    "active_seconds": round(result["quality"]["active_seconds"], 3),
                     "input_shape": [1, N_MELS, MAX_FRAMES, 1],
                     "sample_rate": SAMPLE_RATE,
                 }
             )
+
+    except AudioQualityError as exc:
+        st.warning("Audio belum dapat dianalisis.")
+        st.info(str(exc))
 
     except Exception as exc:
         st.error("Prediksi gagal.")
